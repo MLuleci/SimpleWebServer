@@ -8,8 +8,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
 #include <errno.h>
 #include <unistd.h>
+
+// Multi-threading
 #include <pthread.h>
 #include "pthread_pool.h"
 
@@ -27,9 +30,29 @@
 #define MAX_THREADS 10 		// Change according to available stack space
 #define STDIN 0				// File descriptor for standard input
 
-/* Close socket
- * sock: Socket file descriptor to close
- * returns: 0 (success) or 1 (fail)
+// MIME types (add more as needed)
+typedef struct MimeType {
+	char* ext;
+	char* type;
+} MimeType;
+
+const struct MimeType mime[] = {
+	{ "htm", "text/html" },
+    { "html", "text/html" },
+    { "xml", "text/xml" },
+    { "txt", "text/plain" },
+    { "css", "text/css" },
+    { "png", "image/png" },
+    { "gif", "image/gif" },
+    { "jpg", "image/jpg" },
+    { "jpeg", "image/jpeg" },
+    { "zip", "application/zip"}
+};
+
+/** 
+ * Close socket
+ * \param sock The socket file descriptor to close
+ * \return 0 (success) or 1 (fail)
 */
 int closeSocket(int sock) {
 	if (close(sock) < 0) {
@@ -39,9 +62,94 @@ int closeSocket(int sock) {
 	return 0;
 }
 
-/*
+/**
+ * Send error
+ * \param sock The socket to send error response to
+ * \param code The error code to send
+*/
+void sendError(int sock, int code) {
+	char *error;
+
+	switch(code) {
+		case 501:
+			error = "HTTP/1.1 501 Not Implemented";
+			break;
+		case 404:
+			error = "HTTP/1.1 404 Not Found";
+			break;
+		default:
+			error = "HTTP/1.1 500 Internal Server Error";
+			break;
+	}
+
+	send(sock, error, strlen(error), 0);
+}
+
+/**
+ * Make response header
+ * 
+ * It's the caller's responsibility to free the returned string.
+ * 
+ * \param mime_type Content-type to use
+ * \param size Content-length to use
+ * \return Pointer to a string containing the header, NULL on failure
+*/
+char *makeHeader(char *mime_type, long size) {
+	char *tmp;
+	int len;
+
+	// Status line
+	char status [] = "HTTP/1.1 200 OK\r\n";
+
+	// Date
+	time_t rawtime;
+	struct tm *timeinfo;
+	char timebuf [41] = { 'D', 'a', 't', 'e', ':', ' ' };
+
+	time(&rawtime);
+	timeinfo = gmtime(&rawtime);
+	strftime(timebuf + 6, 35, "%a, %d %b %y %T %Z%z\r\n", timeinfo);
+
+	// Connection
+	char conn [] = "Connection: close\r\n";
+
+	// Content type
+	tmp = "Content-Type: ";
+	char *con_type = NULL;
+	if (mime_type) {
+		len = strlen(tmp) + strlen(mime_type) + 3;
+		con_type = (char *) malloc(len * sizeof(char));
+		if (con_type) sprintf(con_type, "%s%s\r\n", tmp, mime_type);
+	}
+
+	// Content length
+	tmp = "Content-Length: ";
+	char *con_len = (char *) malloc((strlen(tmp) + 14) * sizeof(char));
+	if (con_len) sprintf(con_len, "%s%ld\r\n", tmp, size);
+
+	// Composition
+	len = strlen(status) + strlen(timebuf) + strlen(conn) + (con_type ? strlen(con_type) : 0) + (con_len ? strlen(con_len) : 0) + 3;
+	char *header = (char *) malloc(len * sizeof(char));
+	if (!header) return NULL;
+
+	if (con_type && con_len) {
+		sprintf(header, "%s%s%s%s%s\r\n", status, timebuf, conn, con_type, con_len); // Both OK
+	} else if (!con_type && con_len) {
+		sprintf(header, "%s%s%s%s\r\n", status, timebuf, conn, con_len); // con_type fail
+	} else if (con_type && !con_len) {
+		sprintf(header, "%s%s%s%s\r\n", status, timebuf, conn, con_type); // con_len fail
+	} else {
+		sprintf(header, "%s%s%s\r\n", status, timebuf, conn); // Both fail
+	}
+
+	free(con_type);
+	free(con_len);
+	return header;
+}
+
+/**
  * Handle client request
- * arg: The socket file descriptor of the connection
+ * \param arg The socket file descriptor of the connection
 */
 void *handleRequest(void *arg) {
 	int cfd = *(int *) arg;
@@ -59,71 +167,116 @@ void *handleRequest(void *arg) {
 	char *p, *method;
 	int length;
 	p = strchr(buf, ' ');
-	length = (void*)p - buf;
-	method = (char*)malloc((length + 1) * sizeof(char));
-	strncpy(method, buf, length);
-	method[length] = '\0';
+	length = (void *) p - buf;
+	method = (char *) malloc((length + 1) * sizeof(char));
 
-	// Only accept implemented methods
-	if (!strcmp(method, "GET")) {
-		// Get requested URL
-		char *b, *e, *url;
-		b = strchr(buf, '/');
-		e = strchr(b, ' ');
-		length = e - b + 1;
-		url = (char*)malloc((length + 1) * sizeof(char));
-		strncpy(url + 1, b, length);
-		url[0] = '.';
-		url[length] = '\0';
+	if (method != NULL) {
+		strncpy(method, buf, length);
+		method[length] = '\0';
 
-		// Get requested file
-		FILE* fp;
-		if (!strcmp(url, "./")) { // Index requested
-			fp = fopen("./index.html", "r");
-		} else {
-			fp = fopen(url, "r");
-		}
+		// Only accept implemented methods
+		if (!strcmp(method, "GET")) {
 
-		// Send data to client
-		if (fp == NULL) { // 404 Not Found
-			const char *message = "HTTP/1.1 404 Not Found";
-			send(cfd, message, strlen(message), 0);
-		} else {
-			// Get file size
-			fseek(fp, 0, SEEK_END);
-			long size = ftell(fp);
-			rewind(fp);
+			// Get requested URL
+			char *b, *e, *url;
+			b = strchr(buf, '/');
+			e = strchr(b, ' ');
+			length = e - b + 1;
+			url = (char *) malloc((length + 1) * sizeof(char));
 
-			// Read file into memory
-			void *reply = malloc(size * sizeof(char));
-			if (reply != NULL) {
-				fread(reply, sizeof(char), size, fp);
+			if (url != NULL) {
+				strncpy(url + 1, b, length);
+				url[0] = '.';
+				url[length] = '\0';
 
-				// Send data until we're done
-				int total = 0;
-				long bytes_left = size;
-				int n;
-				while(total < size) {
-					if ((n = send(cfd, reply + total, bytes_left, 0)) < 0) {
-						break;
-					}
-					total += n;
-					bytes_left -= n;
+				// Get requested file
+				if (!strcmp(url, "./")) { // Index requested
+					free(url);
+					url = strdup("./index.html");
 				}
-				free(reply);
+				FILE* fp = fopen(url, "r");
+
+				// Get file extension
+				char *ext = NULL;
+				b = strchr(url + 1, '.');
+				if (b != NULL) {
+					e = url + strlen(url);
+					length = e - b;
+					ext = strndup(b + 1, length);
+					for(char* i = ext; *i; i++)
+						*i = tolower(*i);
+				}
+				free(url);
+
+				// Get MIME type
+				char* mime_type = NULL;
+				if (ext != NULL) {
+					length = sizeof(mime) / sizeof(MimeType);
+					for(int i = 0; i < length; i++) {
+						const MimeType *temp = &mime[i];
+						if (!strcmp(ext, temp->ext)) {
+							mime_type = temp->type;
+							break;
+						}
+					}
+					free(ext);
+				}
+
+				// Send data to client
+				if (fp != NULL) {
+					// Get file size
+					fseek(fp, 0, SEEK_END);
+					long size = ftell(fp);
+					rewind(fp);
+
+					// Get header & allocate space for reply
+					char *header = makeHeader(mime_type, size);
+					length = (header ? strlen(header) : 0);
+					void *reply = malloc((size + length) * sizeof(char));
+
+					if (reply != NULL) {
+						// Attach header
+						if(header) memcpy(reply, header, length);
+			
+						// Read file into memory
+						fread(reply + length, sizeof(char), size, fp);
+
+						// Send data until we're done
+						int total = 0;
+						long bytes_left = size + length;
+						int n;
+						while(total < size) {
+							if ((n = send(cfd, reply + total, bytes_left, 0)) < 0) {
+								break;
+							}
+							total += n;
+							bytes_left -= n;
+						}
+
+						if (header) free(header);
+						free(reply);
+					} else { // malloc fail: reply
+						sendError(cfd, 500);
+					}
+					
+					fclose(fp);
+				} else { // 404 Not Found
+					sendError(cfd, 404);
+				}
+			} else { // malloc fail: url
+				sendError(cfd, 500);
 			}
-			fclose(fp);
+		} else { // 501 Not Implemented
+			sendError(cfd, 501);
 		}
-		
-		free(url);
-	} else { // 501 Not Implemented
-		const char *message = "HTTP/1.1 501 Not Implemented";
-		send(cfd, message, strlen(message), 0);
+
+		free(method);
+	} else { // malloc fail: method
+		sendError(cfd, 500);
 	}
 
 	closeSocket(cfd);
 	free(buf);
-	free(method);
 	return NULL;
 }
 
